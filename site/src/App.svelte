@@ -20,6 +20,10 @@
     '/beneficiary/:id': BeneficiaryDetail,
     '/talent/:id': TalentDetail,
   };
+
+  function afterPageLoad() {
+    window.scrollTo(0, 0);
+  }
 </script>
 
 <div class="app">
@@ -35,7 +39,7 @@
       <p>Error loading data: {$error}</p>
     </div>
   {:else}
-    <Router {routes} />
+    <Router {routes} on:routeLoaded={afterPageLoad} />
   {/if}
 
   <footer>
