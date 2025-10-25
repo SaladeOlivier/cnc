@@ -4,6 +4,8 @@ https://saladeolivier.github.io/cnc/
 
 Un site web statique pour explorer, filtrer et analyser les décisions de financement du Centre National du Cinéma et de l'Image Animée (CNC), spécifiquement pour le programme "Fonds d'aide aux créateurs vidéo sur Internet (CNC Talent)".
 
+C'était l'occasion de tester ce que vaut Claude Code
+
 ## Fonctionnalités
 
 - **Parcourir les Commissions** : Visualiser toutes les réunions de commission avec dates, présidents et membres

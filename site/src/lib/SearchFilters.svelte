@@ -95,7 +95,7 @@
 
   .filters {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr));
     gap: 15px;
   }
 
@@ -118,6 +118,14 @@
     font-size: 1rem;
     background: white;
     cursor: pointer;
+    width: 100%;
+    max-width: 100%;
+    text-overflow: ellipsis;
+  }
+
+  select option {
+    text-overflow: ellipsis;
+    overflow: hidden;
   }
 
   select:focus {
@@ -126,8 +134,23 @@
   }
 
   @media (max-width: 768px) {
+    .search-section {
+      padding: 15px;
+    }
+
     .search-bar {
       flex-direction: column;
+    }
+
+    input,
+    button,
+    select {
+      padding: 10px 12px;
+      font-size: 0.95rem;
+    }
+
+    button {
+      padding: 10px 16px;
     }
 
     .filters {

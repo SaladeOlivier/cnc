@@ -61,16 +61,38 @@
   .app {
     width: 100%;
     max-width: 1200px;
-    min-width: 1200px;
     margin: 0 auto;
     padding: 20px;
   }
 
-  @media (max-width: 1240px) {
+  @media (min-width: 1200px) {
     .app {
-      min-width: auto;
-      width: 100%;
+      width: 1200px;
+    }
+  }
+
+  @media (max-width: 768px) {
+    .app {
       padding: 20px;
+    }
+
+    :global(.card) {
+      padding: 15px !important;
+    }
+
+    :global(.stats) {
+      gap: 15px !important;
+      flex-wrap: wrap;
+    }
+
+    :global(.info-header) {
+      flex-direction: column !important;
+      align-items: flex-start !important;
+      gap: 15px;
+    }
+
+    :global(.search-button) {
+      width: 100%;
     }
   }
 

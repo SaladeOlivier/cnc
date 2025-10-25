@@ -56,4 +56,16 @@
     background: white;
     border-radius: 8px;
   }
+
+  @media (max-width: 768px) {
+    .view-header {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 10px;
+    }
+
+    h2 {
+      font-size: 1.5rem;
+    }
+  }
 </style>

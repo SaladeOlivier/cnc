@@ -154,6 +154,8 @@
     color: #0047ab;
     margin-bottom: 10px;
     font-size: 1.3rem;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
   }
 
   .meta {
@@ -183,5 +185,30 @@
     color: #ff6b6b;
     font-weight: 600;
     font-size: 1.1rem;
+  }
+
+  @media (max-width: 768px) {
+    .view-header {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 10px;
+    }
+
+    h2 {
+      font-size: 1.5rem;
+    }
+
+    h3 {
+      font-size: 1.1rem;
+    }
+
+    .badge {
+      font-size: 0.75rem;
+      padding: 3px 8px;
+    }
+
+    .amount {
+      font-size: 1rem;
+    }
   }
 </style>
