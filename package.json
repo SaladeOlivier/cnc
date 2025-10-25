@@ -1,0 +1,28 @@
+{
+  "name": "cnc-funding-explorer",
+  "version": "1.0.0",
+  "description": "Static site to explore CNC funding data",
+  "type": "module",
+  "scripts": {
+    "scrape": "node scripts/scraper.js",
+    "scrape:all": "node scripts/scraper.js --all",
+    "scrape:aid": "node scripts/scraper.js --aid",
+    "scrape:test": "node scripts/scraper.js --limit 2",
+    "list-aids": "node scripts/list-aids.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui",
+    "dev": "cd site && npm run dev",
+    "build": "cd site && npm run build",
+    "preview": "cd site && npm run preview"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0-rc.12",
+    "date-fns": "^4.1.0",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "@vitest/ui": "^3.2.4",
+    "vitest": "^3.2.4"
+  }
+}

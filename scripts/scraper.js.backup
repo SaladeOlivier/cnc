@@ -1,0 +1,1219 @@
+import fetch from 'node-fetch';
+import * as cheerio from 'cheerio';
+import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+import { parse, format, isValid } from 'date-fns';
+import { fr } from 'date-fns/locale';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const BASE_URL = 'https://www.cnc.fr';
+const SEARCH_URL = `${BASE_URL}/professionnels/aides-et-financements/resultats-commissions`;
+
+// Data structures with ID-based relationships
+const data = {
+  commissions: new Map(),      // id -> commission object
+  projects: new Map(),          // id -> project object
+  beneficiaries: new Map(),     // id -> beneficiary object
+  people: new Map(),            // id -> person object
+  talents: new Map()            // id -> talent object (can be person or organization)
+};
+
+// NOTE: We now use deterministic IDs based on content (aid name, date, project name, etc.)
+// This ensures stable IDs across scraper runs and prevents dead links on the frontend
+
+// Helper to delay between requests
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Generate a slug from a string for use in IDs
+ * Handles case, accents, special characters, and extra whitespace
+ */
+function slugify(text) {
+  return text
+    .trim()                           // Remove leading/trailing whitespace
+    .toLowerCase()                    // Convert to lowercase
+    .normalize('NFD')                 // Decompose accented characters
+    .replace(/[\u0300-\u036f]/g, '')  // Remove accents
+    .replace(/['\u2019]/g, '')        // Remove apostrophes and smart quotes
+    .replace(/[^a-z0-9]+/g, '-')      // Replace non-alphanumeric with single -
+    .replace(/^-+|-+$/g, '');         // Remove leading/trailing -
+}
+
+/**
+ * Generate deterministic commission ID from aid name and date
+ * Format: com_<aid-slug>_<date>
+ * Example: com_cnc-talent_2025-07-03
+ */
+function generateCommissionId(aidName, date) {
+  const aidSlug = slugify(aidName);
+  const dateSlug = date || 'no-date';
+  return `com_${aidSlug}_${dateSlug}`;
+}
+
+/**
+ * Generate deterministic project ID from aid name, project name, and commission date
+ * Format: pro_<aid-slug>_<project-slug>_<date>
+ * We include date to handle cases where same project name appears in different commissions
+ * Example: pro_cnc-talent_a-musee-vous_2025-07-03
+ */
+function generateProjectId(aidName, projectName, commissionDate) {
+  const aidSlug = slugify(aidName);
+  const projectSlug = slugify(projectName).substring(0, 50); // Limit length
+  const dateSlug = commissionDate || 'no-date';
+  return `pro_${aidSlug}_${projectSlug}_${dateSlug}`;
+}
+
+/**
+ * Generate deterministic beneficiary ID from name
+ * Format: ben_<name-slug>
+ * Example: ben_dada-media
+ */
+function generateBeneficiaryId(name) {
+  const slug = slugify(name);
+  return `ben_${slug}`;
+}
+
+/**
+ * Generate deterministic talent ID from name
+ * Format: tal_<name-slug>
+ * Example: tal_fouzia-kechkech
+ */
+function generateTalentId(name) {
+  const slug = slugify(name);
+  return `tal_${slug}`;
+}
+
+/**
+ * Normalize a name for consistent storage
+ * Preserves the original casing but normalizes accents and whitespace
+ */
+function normalizeName(name) {
+  return name
+    .trim()
+    .replace(/\s+/g, ' ')  // Normalize multiple spaces to single space
+    .normalize('NFC');      // Use composed form for accents (é instead of e + combining accent)
+}
+
+// ============================================================================
+// EXTRACTION FUNCTIONS - Modular data extraction with fallback strategies
+// ============================================================================
+
+/**
+ * Extract commission date from page with multiple fallback strategies
+ * Returns ISO date string (YYYY-MM-DD) or null
+ */
+function extractCommissionDate($) {
+  const strategies = [
+    // Strategy 1: From <p class="inline"> tag (most common)
+    () => {
+      const dateText = $('p.inline').first().text().trim();
+      if (dateText) return parseFrenchDate(dateText);
+      return null;
+    },
+
+    // Strategy 2: From any <p> tag containing a date pattern
+    () => {
+      const datePattern = /(\d{1,2})\s+(janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre)\s+(\d{4})/i;
+      let foundDate = null;
+
+      $('p').each((_i, el) => {
+        const text = $(el).text().trim();
+        if (datePattern.test(text)) {
+          foundDate = parseFrenchDate(text.match(datePattern)[0]);
+          return false; // Break loop
+        }
+      });
+
+      return foundDate;
+    },
+
+    // Strategy 3: From page title
+    () => {
+      const title = $('h1, .page-title').first().text();
+      const datePattern = /(\d{1,2})\s+(janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre)\s+(\d{4})/i;
+      const match = title.match(datePattern);
+      if (match) return parseFrenchDate(match[0]);
+      return null;
+    }
+  ];
+
+  for (const strategy of strategies) {
+    try {
+      const result = strategy();
+      if (result) {
+        return result;
+      }
+    } catch (err) {
+      // Strategy failed, try next one
+      continue;
+    }
+  }
+
+  console.warn('⚠️  Could not extract commission date');
+  return null;
+}
+
+/**
+ * Extract commission members (president and members) with fallback strategies
+ * Returns { presidentId: string|null, memberIds: string[] }
+ */
+function extractCommissionMembers($, commissionId) {
+  const presidentTitles = [
+    'president',
+    'presidente',
+    'président',
+    'présidente',
+    'president suppleant',
+    'presidente suppleante',
+    'président suppléant',
+    'présidente suppléante'
+  ];
+
+  let presidentId = null;
+  const memberIds = [];
+
+  const strategies = [
+    // Strategy 1: From "Membres présents" section with <ul><li> structure
+    () => {
+      const membersSection = $('.clearfix:contains("Membres présents")');
+      if (membersSection.length === 0) return false;
+
+      membersSection.find('ul li').each((_i, li) => {
+        let memberText = $(li).text().trim();
+        const memberTextLower = memberText.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+        // Check if any president title is in the text
+        let isPresident = false;
+        for (const title of presidentTitles) {
+          const normalizedTitle = title.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+          if (memberTextLower.includes(normalizedTitle)) {
+            isPresident = true;
+            // Remove the title from the member text
+            const regex = new RegExp(`\\(?${title}\\)?`, 'gi');
+            memberText = memberText.replace(regex, '').trim();
+            break;
+          }
+        }
+
+        const talentId = getOrCreateTalent(memberText);
+        if (talentId) {
+          if (isPresident) {
+            presidentId = talentId;
+          } else {
+            memberIds.push(talentId);
+          }
+
+          // Add commission reference to talent
+          const talent = data.talents.get(talentId);
+          if (talent && !talent.commissionIds) {
+            talent.commissionIds = [];
+          }
+          if (talent && !talent.commissionIds.includes(commissionId)) {
+            talent.commissionIds.push(commissionId);
+          }
+        }
+      });
+
+      return presidentId !== null || memberIds.length > 0;
+    },
+
+    // Strategy 2: From paragraph text with "Président :" and "Membres :" labels
+    () => {
+      const allText = $('.clearfix, .content, .main-content').text();
+
+      // Extract president
+      const presidentMatch = allText.match(/Président[e]?\s*[:：]\s*([^\n,]+)/i);
+      if (presidentMatch) {
+        presidentId = getOrCreateTalent(presidentMatch[1].trim());
+        if (presidentId) {
+          const talent = data.talents.get(presidentId);
+          if (talent) {
+            if (!talent.commissionIds) talent.commissionIds = [];
+            if (!talent.commissionIds.includes(commissionId)) {
+              talent.commissionIds.push(commissionId);
+            }
+          }
+        }
+      }
+
+      // Extract members
+      const membersMatch = allText.match(/Membres\s*[:：]\s*([^\n]+)/i);
+      if (membersMatch) {
+        const membersText = membersMatch[1];
+        const names = membersText.split(/[,;]/).map(n => n.trim()).filter(n => n.length > 0);
+
+        names.forEach(name => {
+          const talentId = getOrCreateTalent(name);
+          if (talentId) {
+            memberIds.push(talentId);
+            const talent = data.talents.get(talentId);
+            if (talent) {
+              if (!talent.commissionIds) talent.commissionIds = [];
+              if (!talent.commissionIds.includes(commissionId)) {
+                talent.commissionIds.push(commissionId);
+              }
+            }
+          }
+        });
+      }
+
+      return presidentId !== null || memberIds.length > 0;
+    }
+  ];
+
+  for (const strategy of strategies) {
+    try {
+      if (strategy()) {
+        break; // Success, stop trying strategies
+      }
+    } catch (err) {
+      console.warn('⚠️  Member extraction strategy failed:', err.message);
+      continue;
+    }
+  }
+
+  if (!presidentId && memberIds.length === 0) {
+    console.warn('⚠️  Could not extract commission members');
+  }
+
+  return { presidentId, memberIds };
+}
+
+/**
+ * Extract project name with fallback strategies
+ */
+function extractProjectName($temp) {
+  const strategies = [
+    // Strategy 1: First <strong> tag
+    () => $temp.find('strong').first().text().trim(),
+
+    // Strategy 2: First <b> tag
+    () => $temp.find('b').first().text().trim(),
+
+    // Strategy 3: First bold text via CSS
+    () => $temp.find('[style*="font-weight: bold"]').first().text().trim(),
+
+    // Strategy 4: First line of text (fallback)
+    () => {
+      const text = $temp.text().trim();
+      const firstLine = text.split(/\n/)[0];
+      return firstLine.substring(0, 100); // Limit length
+    }
+  ];
+
+  for (const strategy of strategies) {
+    try {
+      const name = strategy();
+      if (name) {
+        // Clean up trailing dash
+        return name.replace(/–$/, '').trim();
+      }
+    } catch (err) {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Extract project beneficiary with fallback strategies
+ */
+function extractProjectBeneficiary(text) {
+  const strategies = [
+    // Strategy 1: Standard "Bénéficiaire :" pattern
+    () => {
+      const match = text.match(/Bénéficiaire\s*[:：]\s*([^\n<]+)/i);
+      return match ? match[1].trim() : null;
+    },
+
+    // Strategy 2: "Beneficiaire" without accent
+    () => {
+      const match = text.match(/Beneficiaire\s*[:：]\s*([^\n<]+)/i);
+      return match ? match[1].trim() : null;
+    },
+
+    // Strategy 3: "Demandeur :" alternative label
+    () => {
+      const match = text.match(/Demandeur\s*[:：]\s*([^\n<]+)/i);
+      return match ? match[1].trim() : null;
+    },
+
+    // Strategy 4: "Société :" or "Entreprise :"
+    () => {
+      const match = text.match(/(?:Société|Entreprise)\s*[:：]\s*([^\n<]+)/i);
+      return match ? match[1].trim() : null;
+    }
+  ];
+
+  for (const strategy of strategies) {
+    try {
+      const result = strategy();
+      if (result) return result;
+    } catch (err) {
+      continue;
+    }
+  }
+
+  return '';
+}
+
+/**
+ * Extract project talent(s) with fallback strategies
+ */
+function extractProjectTalent(text) {
+  const strategies = [
+    // Strategy 1: Standard "Talent :" pattern
+    () => {
+      const match = text.match(/Talent\s*[:：]\s*([^\n<]+)/i);
+      return match ? match[1].trim() : null;
+    },
+
+    // Strategy 2: "Auteur :" pattern
+    () => {
+      const match = text.match(/Auteur\s*[:：]\s*([^\n<]+)/i);
+      return match ? match[1].trim() : null;
+    },
+
+    // Strategy 3: "Réalisateur :" pattern
+    () => {
+      const match = text.match(/Réalisateur\s*[:：]\s*([^\n<]+)/i);
+      return match ? match[1].trim() : null;
+    },
+
+    // Strategy 4: "Créateur :" pattern
+    () => {
+      const match = text.match(/Créateur\s*[:：]\s*([^\n<]+)/i);
+      return match ? match[1].trim() : null;
+    }
+  ];
+
+  for (const strategy of strategies) {
+    try {
+      const result = strategy();
+      if (result) return result;
+    } catch (err) {
+      continue;
+    }
+  }
+
+  return '';
+}
+
+/**
+ * Extract project amount with fallback strategies
+ */
+function extractProjectAmount(text) {
+  const strategies = [
+    // Strategy 1: "Aide accordée : X €"
+    () => {
+      const match = text.match(/Aide accordée\s*[:：]\s*(?::)?\s*([\d\s]+)\s*€/i);
+      if (match) {
+        const amountStr = match[1].replace(/\s/g, '').replace(/&nbsp;/g, '');
+        return parseInt(amountStr, 10);
+      }
+      return null;
+    },
+
+    // Strategy 2: "Montant : X €"
+    () => {
+      const match = text.match(/Montant\s*[:：]\s*([\d\s]+)\s*€/i);
+      if (match) {
+        const amountStr = match[1].replace(/\s/g, '').replace(/&nbsp;/g, '');
+        return parseInt(amountStr, 10);
+      }
+      return null;
+    },
+
+    // Strategy 3: "X € accordé"
+    () => {
+      const match = text.match(/([\d\s]+)\s*€\s*accordé/i);
+      if (match) {
+        const amountStr = match[1].replace(/\s/g, '').replace(/&nbsp;/g, '');
+        return parseInt(amountStr, 10);
+      }
+      return null;
+    },
+
+    // Strategy 4: Any number followed by €
+    () => {
+      const match = text.match(/([\d\s]+)\s*€/);
+      if (match) {
+        const amountStr = match[1].replace(/\s/g, '').replace(/&nbsp;/g, '');
+        const amount = parseInt(amountStr, 10);
+        // Sanity check: amount should be reasonable (between 100 and 1,000,000)
+        if (amount >= 100 && amount <= 1000000) {
+          return amount;
+        }
+      }
+      return null;
+    }
+  ];
+
+  for (const strategy of strategies) {
+    try {
+      const result = strategy();
+      if (result !== null && !isNaN(result)) return result;
+    } catch (err) {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Get or create a beneficiary with deduplication
+ */
+function getOrCreateBeneficiary(name) {
+  if (!name || name.trim() === '') return null;
+
+  const normalizedName = normalizeName(name);
+  const id = generateBeneficiaryId(name);
+
+  // Check if beneficiary already exists
+  if (data.beneficiaries.has(id)) {
+    const beneficiary = data.beneficiaries.get(id);
+
+    // Update the name to the most recent capitalization if it's "better"
+    // Prefer names with proper capitalization over all-caps
+    const existingName = beneficiary.name;
+    const hasProperCase = /[a-z]/.test(normalizedName) && /[A-Z]/.test(normalizedName);
+    const existingHasProperCase = /[a-z]/.test(existingName) && /[A-Z]/.test(existingName);
+
+    if (hasProperCase && !existingHasProperCase) {
+      beneficiary.name = normalizedName;
+    }
+
+    return id;
+  }
+
+  // Create new beneficiary
+  data.beneficiaries.set(id, {
+    id,
+    slug: slugify(name),
+    name: normalizedName,
+    projectIds: [],
+    commissionIds: []
+  });
+
+  return id;
+}
+
+/**
+ * Split talent names by comma or "et" (and)
+ * Examples:
+ *   "Leslie Menahem et Julie Joseph" → ["Leslie Menahem", "Julie Joseph"]
+ *   "Thomas Métivier, Camille Fievez, Ambroise Carminati" → ["Thomas Métivier", "Camille Fievez", "Ambroise Carminati"]
+ */
+function splitTalentNames(talentString) {
+  if (!talentString || talentString.trim() === '') return [];
+
+  // Split by comma first, then split each part by " et "
+  const parts = talentString.split(',').flatMap(part => {
+    // Split by " et " (French "and")
+    return part.split(/\s+et\s+/i);
+  });
+
+  // Clean up and filter empty strings
+  return parts
+    .map(name => name.trim())
+    .filter(name => name.length > 0);
+}
+
+/**
+ * Get or create a talent (person or organization) with deduplication
+ */
+function getOrCreateTalent(name) {
+  if (!name || name.trim() === '') return null;
+
+  const normalizedName = normalizeName(name);
+  const id = generateTalentId(name);
+
+  // Check if talent already exists
+  if (data.talents.has(id)) {
+    const talent = data.talents.get(id);
+
+    // Update the name to the most recent capitalization if it's "better"
+    // Prefer names with proper capitalization over all-caps
+    const existingName = talent.name;
+    const hasProperCase = /[a-z]/.test(normalizedName) && /[A-Z]/.test(normalizedName);
+    const existingHasProperCase = /[a-z]/.test(existingName) && /[A-Z]/.test(existingName);
+
+    if (hasProperCase && !existingHasProperCase) {
+      talent.name = normalizedName;
+    }
+
+    return id;
+  }
+
+  // Create new talent
+  data.talents.set(id, {
+    id,
+    slug: slugify(name),
+    name: normalizedName,
+    projectIds: [],
+    commissionIds: []  // Track commissions where this talent is a member/president
+  });
+
+  return id;
+}
+
+/**
+ * Load existing data to enable partial updates
+ * - Loads all existing beneficiaries and talents for deduplication
+ * - Loads existing commissions/projects from OTHER aids (to preserve them)
+ * - Updates ID counters to avoid conflicts
+ */
+function loadExistingData(targetAids) {
+  const mainDataPath = join(__dirname, '..', 'data', 'cnc-data.json');
+
+  if (!existsSync(mainDataPath)) {
+    console.log('No existing data found, starting fresh...');
+    return null;
+  }
+
+  console.log('Loading existing data for partial update...');
+  const existingData = JSON.parse(readFileSync(mainDataPath, 'utf-8'));
+
+  // Load ALL beneficiaries and talents (for deduplication across all aids)
+  if (existingData.beneficiaries) {
+    existingData.beneficiaries.forEach(b => {
+      data.beneficiaries.set(b.id, {
+        ...b,
+        projectIds: b.projectIds || [],
+        commissionIds: b.commissionIds || []
+      });
+    });
+    console.log(`  Loaded ${data.beneficiaries.size} existing beneficiaries`);
+  }
+
+  if (existingData.talents) {
+    existingData.talents.forEach(t => {
+      data.talents.set(t.id, {
+        ...t,
+        projectIds: t.projectIds || [],
+        commissionIds: t.commissionIds || []
+      });
+    });
+    console.log(`  Loaded ${data.talents.size} existing talents`);
+  }
+
+  // Store commissions and projects from OTHER aids (to preserve them)
+  const preservedData = {
+    commissions: [],
+    projects: []
+  };
+
+  if (existingData.commissions) {
+    preservedData.commissions = existingData.commissions.filter(
+      c => !targetAids.includes(c.aidName)
+    );
+    console.log(`  Preserving ${preservedData.commissions.length} commissions from other aids`);
+  }
+
+  if (existingData.projects) {
+    // Keep projects that belong to preserved commissions
+    const preservedCommissionIds = new Set(preservedData.commissions.map(c => c.id));
+    preservedData.projects = existingData.projects.filter(
+      p => preservedCommissionIds.has(p.commissionId)
+    );
+    console.log(`  Preserving ${preservedData.projects.length} projects from other aids`);
+  }
+
+  return preservedData;
+}
+
+/**
+ * Cleanup orphaned entities (beneficiaries/talents with no project references)
+ */
+function cleanupOrphanedEntities() {
+  // Get all project IDs that actually exist
+  const existingProjectIds = new Set(data.projects.keys());
+
+  // Clean up beneficiaries
+  for (const [id, beneficiary] of data.beneficiaries) {
+    // Filter out non-existent project references
+    beneficiary.projectIds = beneficiary.projectIds.filter(
+      projId => existingProjectIds.has(projId)
+    );
+
+    // Remove beneficiary if it has no projects
+    if (beneficiary.projectIds.length === 0) {
+      data.beneficiaries.delete(id);
+    }
+  }
+
+  // Clean up talents
+  for (const [id, talent] of data.talents) {
+    // Filter out non-existent project references
+    talent.projectIds = talent.projectIds.filter(
+      projId => existingProjectIds.has(projId)
+    );
+
+    // Keep talent if it has projects OR is a commission member/president
+    if (talent.projectIds.length === 0 && (!talent.commissionIds || talent.commissionIds.length === 0)) {
+      data.talents.delete(id);
+    }
+  }
+}
+
+/**
+ * Merge newly scraped data with preserved data from other aids
+ */
+function mergeWithPreservedData(preservedData) {
+  if (!preservedData) return;
+
+  console.log('\nMerging with preserved data from other aids...');
+
+  // Add preserved commissions to the data
+  preservedData.commissions.forEach(c => {
+    data.commissions.set(c.id, c);
+  });
+
+  // Add preserved projects to the data
+  preservedData.projects.forEach(p => {
+    data.projects.set(p.id, p);
+  });
+
+  console.log(`  Total commissions after merge: ${data.commissions.size}`);
+  console.log(`  Total projects after merge: ${data.projects.size}`);
+}
+
+/**
+ * Save per-aid source files for easy reference and debugging
+ */
+function savePerAidSourceFiles(targetAids) {
+  console.log('\nSaving per-aid source files...');
+  const sourcesDir = join(__dirname, '..', 'data', 'sources');
+  mkdirSync(sourcesDir, { recursive: true });
+
+  targetAids.forEach(aidName => {
+    // Get commissions for this aid
+    const aidCommissions = Array.from(data.commissions.values())
+      .filter(c => c.aidName === aidName);
+
+    // Get projects for this aid
+    const commissionIds = new Set(aidCommissions.map(c => c.id));
+    const aidProjects = Array.from(data.projects.values())
+      .filter(p => commissionIds.has(p.commissionId));
+
+    // Get beneficiaries for this aid
+    const projectIds = new Set(aidProjects.map(p => p.id));
+    const aidBeneficiaries = Array.from(data.beneficiaries.values())
+      .filter(b => b.projectIds.some(pId => projectIds.has(pId)));
+
+    // Get talents for this aid
+    const aidTalents = Array.from(data.talents.values())
+      .filter(t =>
+        t.projectIds.some(pId => projectIds.has(pId)) ||
+        t.commissionIds.some(cId => commissionIds.has(cId))
+      );
+
+    const aidData = {
+      aidName,
+      scrapedAt: new Date().toISOString(),
+      commissions: aidCommissions,
+      projects: aidProjects,
+      beneficiaries: aidBeneficiaries,
+      talents: aidTalents,
+      stats: {
+        totalCommissions: aidCommissions.length,
+        totalProjects: aidProjects.length,
+        totalBeneficiaries: aidBeneficiaries.length,
+        totalTalents: aidTalents.length
+      }
+    };
+
+    const filename = `${slugify(aidName)}.json`;
+    const filepath = join(sourcesDir, filename);
+    writeFileSync(filepath, JSON.stringify(aidData, null, 2), 'utf-8');
+    console.log(`  Saved: ${filename} (${aidCommissions.length} commissions, ${aidProjects.length} projects)`);
+  });
+}
+
+/**
+ * Fetch all commission result pages for a specific aid
+ */
+async function fetchCommissionList(aidName, limit) {
+  console.log(`Fetching commission list for: ${aidName}`);
+
+  const commissionLinks = [];
+  let currentPage = 1;
+  let hasMorePages = true;
+
+  while (hasMorePages && (!limit || currentPage <= limit)) {
+    // Build URL with all required parameters
+    const params = new URLSearchParams({
+      'nomAide': aidName,
+      '_CncPortletRechercheResultatsCommissions_INSTANCE_xLSVbj1jyJkM_cur': currentPage,
+      'p_p_id': 'CncPortletRechercheResultatsCommissions_INSTANCE_xLSVbj1jyJkM',
+      '_CncPortletRechercheResultatsCommissions_INSTANCE_xLSVbj1jyJkM_secteur': '',
+      '_CncPortletRechercheResultatsCommissions_INSTANCE_xLSVbj1jyJkM_annee': '',
+      '_CncPortletRechercheResultatsCommissions_INSTANCE_xLSVbj1jyJkM_nomAide': ''
+    });
+
+    const url = `${SEARCH_URL}?${params.toString()}`;
+    console.log(`Fetching page ${currentPage}...`);
+
+    const response = await fetch(url);
+    const html = await response.text();
+    const $ = cheerio.load(html);
+
+    // Find all commission result links from the table
+    let foundOnThisPage = 0;
+    $('table.table-striped tbody tr').each((_i, row) => {
+      const $row = $(row);
+      const link = $row.find('a[href*="resultats-de-la-commission"]').first();
+
+      if (link.length > 0) {
+        const href = link.attr('href');
+        if (href) {
+          const fullUrl = href.startsWith('http') ? href : `${BASE_URL}${href}`;
+          if (!commissionLinks.includes(fullUrl)) {
+            commissionLinks.push(fullUrl);
+            foundOnThisPage++;
+          }
+        }
+      }
+    });
+
+    console.log(`Found ${foundOnThisPage} commissions on page ${currentPage}`);
+
+    // Check if there's a next page
+    const nextPageLink = $('a.next, a[rel="next"]').length > 0;
+
+    // If we found no results on this page or no pagination, stop
+    if (foundOnThisPage === 0 || (!nextPageLink && currentPage > 1)) {
+      hasMorePages = false;
+    } else {
+      currentPage++;
+      await delay(1000); // Rate limiting between page requests
+    }
+
+    // Safety limit to avoid infinite loops
+    if (currentPage > 100) {
+      console.log('Reached page limit, stopping...');
+      hasMorePages = false;
+    }
+  }
+
+  console.log(`Found ${commissionLinks.length} total commission pages`);
+  return commissionLinks;
+}
+
+/**
+ * Parse a commission detail page
+ * @param {string} url - The URL of the commission page
+ * @param {string} aidName - The aid name from the search query
+ */
+async function parseCommissionPage(url, aidName) {
+  console.log(`Parsing commission: ${url}`);
+
+  try {
+    const response = await fetch(url);
+    const html = await response.text();
+    const $ = cheerio.load(html);
+
+    // Use modular extraction function for date
+    const commissionDate = extractCommissionDate($);
+
+    // Generate deterministic commission ID
+    const commissionId = generateCommissionId(aidName, commissionDate);
+
+    // Extract commission metadata
+    const commissionData = {
+      id: commissionId,
+      url,
+      date: commissionDate,
+      aidName: aidName || null,
+      presidentId: null,
+      memberIds: [],
+      projectIds: []
+    };
+
+    // Use modular extraction function for members
+    const members = extractCommissionMembers($, commissionId);
+    commissionData.presidentId = members.presidentId;
+    commissionData.memberIds = members.memberIds;
+
+    // Extract projects - they can be in <p> tags or spread across <br> within a single <p>
+    let currentCategory = null;
+
+    $('.col-12.col-lg-10 .clearfix').each((_idx, clearfixDiv) => {
+      const $clearfix = $(clearfixDiv);
+
+      // Iterate through children of each clearfix div
+      $clearfix.children().each((_i, el) => {
+        const $el = $(el);
+
+        // Track category headers
+        if ($el.is('h3')) {
+          currentCategory = $el.text().trim();
+          return;
+        }
+
+        // Parse project paragraphs
+        if ($el.is('p')) {
+          const html = $el.html();
+          if (!html) return;
+
+          // Check if this paragraph contains <strong> or <b> tags (project name indicator)
+          if (!html.includes('<strong>') && !html.includes('<b>')) return;
+
+          // Try to split by double <br> which separates multiple projects in one <p>
+          const projectBlocks = html.split(/<br\s*\/?>\s*<br\s*\/?>/i);
+
+          // Process each block
+          projectBlocks.forEach(block => {
+            // Only process blocks that have a <strong> or <b> tag (project name)
+            if (block.includes('<strong>') || block.includes('<b>')) {
+              const projectId = parseProject(block, currentCategory, commissionId, aidName, commissionDate, $);
+
+              if (projectId) {
+                commissionData.projectIds.push(projectId);
+
+                // Update beneficiary with commission reference
+                const project = data.projects.get(projectId);
+                if (project && project.beneficiaryId) {
+                  const beneficiary = data.beneficiaries.get(project.beneficiaryId);
+                  if (beneficiary && !beneficiary.commissionIds.includes(commissionId)) {
+                    beneficiary.commissionIds.push(commissionId);
+                  }
+                }
+              }
+            }
+          });
+        }
+      });
+    });
+
+    // Store commission in the Map
+    data.commissions.set(commissionId, commissionData);
+
+    return commissionData;
+  } catch (error) {
+    console.error(`Error parsing ${url}:`, error);
+    return null;
+  }
+}
+
+/**
+ * Parse a single project from HTML text and return its ID
+ */
+function parseProject(htmlText, category, commissionId, aidName, commissionDate, $) {
+  const $temp = $('<div>').html(htmlText);
+  const text = $temp.text();
+
+  // Use modular extraction functions with fallback strategies
+  const name = extractProjectName($temp);
+  if (!name) return null; // Skip if no project name
+
+  const beneficiaryName = extractProjectBeneficiary(text);
+  const talentName = extractProjectTalent(text);
+  const amount = extractProjectAmount(text);
+
+  // Extract description (everything between name and talent, excluding the project name)
+  let description = '';
+  const lines = text.split(/\n|<br>/);
+  if (lines.length > 0) {
+    const firstLine = lines[0];
+    const descMatch = firstLine.replace(name, '').trim();
+    if (descMatch && descMatch.startsWith('–')) {
+      description = descMatch.substring(1).trim();
+    }
+  }
+
+  // Determine project category
+  let projectCategory = category || '';
+  if (text.includes('aide au pilote')) {
+    projectCategory = category ? `${category} - Aide au pilote` : 'Aide au pilote';
+  } else if (text.includes('bourse d\'encouragement')) {
+    projectCategory = category ? `${category} - Bourse d'encouragement` : 'Bourse d\'encouragement';
+  }
+
+  // Create or get beneficiary and talents with deduplication
+  const beneficiaryId = getOrCreateBeneficiary(beneficiaryName);
+
+  // Parse multiple talents (split by comma or "et")
+  const talentNames = splitTalentNames(talentName);
+  const talentIds = talentNames.map(name => getOrCreateTalent(name)).filter(Boolean);
+
+  // Generate deterministic project ID
+  const projectId = generateProjectId(aidName, name, commissionDate);
+
+  // Create project object with IDs
+  const project = {
+    id: projectId,
+    name,
+    description,
+    beneficiaryId,
+    talentIds,  // Array of talent IDs instead of single talentId
+    amount,
+    category: projectCategory,
+    commissionId
+  };
+
+  // Store project
+  data.projects.set(projectId, project);
+
+  // Update beneficiary's project list
+  if (beneficiaryId) {
+    const beneficiary = data.beneficiaries.get(beneficiaryId);
+    if (beneficiary && !beneficiary.projectIds.includes(projectId)) {
+      beneficiary.projectIds.push(projectId);
+    }
+  }
+
+  // Update each talent's project list
+  talentIds.forEach(talentId => {
+    const talent = data.talents.get(talentId);
+    if (talent && !talent.projectIds.includes(projectId)) {
+      talent.projectIds.push(projectId);
+    }
+  });
+
+  return projectId;
+}
+
+/**
+ * Convert French date format to ISO date
+ */
+function parseFrenchDate(frenchDate) {
+  if (!frenchDate) return null;
+
+  try {
+    // Try to parse French date format like "15 décembre 2022" or "3 juillet 2025"
+    // date-fns format: d = day (1-31), MMMM = full month name, yyyy = 4-digit year
+    const parsedDate = parse(frenchDate.trim(), 'd MMMM yyyy', new Date(), { locale: fr });
+
+    // Check if the date is valid
+    if (!isValid(parsedDate)) {
+      console.warn(`⚠️  Could not parse date: "${frenchDate}"`);
+      return frenchDate; // Return as-is if parsing fails
+    }
+
+    // Return in ISO format (YYYY-MM-DD)
+    return format(parsedDate, 'yyyy-MM-dd');
+  } catch (error) {
+    console.warn(`⚠️  Error parsing date "${frenchDate}":`, error.message);
+    return frenchDate; // Return as-is if parsing fails
+  }
+}
+
+/**
+ * Fetch all available aid names from the search page
+ */
+async function fetchAllAidNames() {
+  console.log('Fetching list of all available aids...');
+
+  try {
+    const response = await fetch(SEARCH_URL);
+    const html = await response.text();
+    const $ = cheerio.load(html);
+
+    const aidNames = [];
+
+    // Extract aid names from the specific nomAide select element only
+    $('#_CncPortletRechercheResultatsCommissions_INSTANCE_xLSVbj1jyJkM_nomAide option').each((_i, option) => {
+      const value = $(option).attr('value');
+      // Filter out empty values, "Sélectionnez" and numeric years
+      if (value &&
+          value !== '' &&
+          !value.toLowerCase().includes('sélectionnez') &&
+          !/^\d{4}$/.test(value)) { // Exclude 4-digit years
+        aidNames.push(value.trim());
+      }
+    });
+
+    // Remove duplicates and sort
+    const uniqueAids = [...new Set(aidNames)].sort();
+    console.log(`Found ${uniqueAids.length} aid types`);
+
+    return uniqueAids;
+  } catch (error) {
+    console.error('Error fetching aid names:', error.message);
+    return [];
+  }
+}
+
+/**
+ * Main scraping function
+ */
+async function scrape() {
+  console.log('Starting CNC data scraping...');
+
+  // Get target aids from command line args or use default
+  const args = process.argv.slice(2);
+  let targetAids = [];
+  let limitCommissions = null; // null = no limit
+
+  // Check for --limit flag
+  if (args.includes('--limit')) {
+    const limitIndex = args.indexOf('--limit');
+    if (args[limitIndex + 1]) {
+      limitCommissions = parseInt(args[limitIndex + 1], 10);
+      if (isNaN(limitCommissions) || limitCommissions < 1) {
+        console.error('--limit must be a positive number');
+        process.exit(1);
+      }
+      console.log(`⚠️  TEST MODE: Limiting to ${limitCommissions} commission(s) per aid\n`);
+    } else {
+      console.error('No number specified after --limit flag');
+      process.exit(1);
+    }
+  }
+
+  if (args.includes('--all')) {
+    // Scrape all available aids
+    console.log('Fetching all available aid types...');
+    targetAids = await fetchAllAidNames();
+    if (targetAids.length === 0) {
+      console.error('Could not fetch aid names. Using default.');
+      targetAids = ["Fonds d'aide aux créateurs vidéo sur Internet (CNC Talent)"];
+    }
+  } else if (args.includes('--aid')) {
+    // Use specified aid
+    const aidIndex = args.indexOf('--aid');
+    if (args[aidIndex + 1] && !args[aidIndex + 1].startsWith('--')) {
+      targetAids = [args[aidIndex + 1]];
+    } else {
+      console.error('No aid name specified after --aid flag');
+      process.exit(1);
+    }
+  } else if (args.includes('--aids')) {
+    // Use multiple specified aids (comma-separated)
+    const aidsIndex = args.indexOf('--aids');
+    if (args[aidsIndex + 1] && !args[aidsIndex + 1].startsWith('--')) {
+      targetAids = args[aidsIndex + 1].split(',').map(a => a.trim());
+    } else {
+      console.error('No aid names specified after --aids flag');
+      process.exit(1);
+    }
+  } else {
+    // Default: CNC Talent
+    targetAids = ["Fonds d'aide aux créateurs vidéo sur Internet (CNC Talent)"];
+  }
+
+  console.log(`\nScraping ${targetAids.length} aid type(s):\n${targetAids.map((a, i) => `  ${i + 1}. ${a}`).join('\n')}\n`);
+
+  try {
+    // Load existing data for partial update (preserves data from other aids)
+    const preservedData = loadExistingData(targetAids);
+
+    // Process each aid type
+    for (let aidIndex = 0; aidIndex < targetAids.length; aidIndex++) {
+      const targetAid = targetAids[aidIndex];
+      console.log(`\n[${aidIndex + 1}/${targetAids.length}] Processing: ${targetAid}`);
+
+      // Get all commission pages for this aid
+      const commissionUrls = await fetchCommissionList(targetAid);
+
+      // Apply limit if specified
+      const urlsToProcess = limitCommissions
+        ? commissionUrls.slice(0, limitCommissions)
+        : commissionUrls;
+
+      console.log(`  Processing ${urlsToProcess.length} of ${commissionUrls.length} commission(s)`);
+
+      // Parse each commission (with rate limiting)
+      for (let i = 0; i < urlsToProcess.length; i++) {
+        const url = urlsToProcess[i];
+        console.log(`  [${i + 1}/${urlsToProcess.length}] Parsing commission...`);
+        await parseCommissionPage(url, targetAid);
+
+        // Rate limiting: wait 1 second between requests
+        if (i < urlsToProcess.length - 1) {
+          await delay(1000);
+        }
+      }
+
+      // Rate limiting between aid types
+      if (aidIndex < targetAids.length - 1) {
+        await delay(2000);
+      }
+    }
+
+    // Merge with preserved data from other aids
+    mergeWithPreservedData(preservedData);
+
+    // Cleanup orphaned beneficiaries and talents
+    console.log('\nCleaning up orphaned entities...');
+    const beforeBeneficiaries = data.beneficiaries.size;
+    const beforeTalents = data.talents.size;
+    cleanupOrphanedEntities();
+    const removedBeneficiaries = beforeBeneficiaries - data.beneficiaries.size;
+    const removedTalents = beforeTalents - data.talents.size;
+    if (removedBeneficiaries > 0 || removedTalents > 0) {
+      console.log(`  Removed ${removedBeneficiaries} orphaned beneficiaries and ${removedTalents} orphaned talents`);
+    }
+
+    // Save per-aid source files
+    savePerAidSourceFiles(targetAids);
+
+    // Convert Maps to Arrays and create denormalized views for JSON serialization
+    const commissionsArray = Array.from(data.commissions.values());
+    const projectsArray = Array.from(data.projects.values());
+    const beneficiariesArray = Array.from(data.beneficiaries.values());
+    const talentsArray = Array.from(data.talents.values());
+
+    // Get list of all unique aid names in the final data
+    const allAidNames = [...new Set(commissionsArray.map(c => c.aidName))].sort();
+
+    // Create denormalized output (backward compatible with old structure)
+    const output = {
+      // Normalized data (with IDs)
+      commissions: commissionsArray,
+      projects: projectsArray,
+      beneficiaries: beneficiariesArray,
+      talents: talentsArray,
+      people: Array.from(data.people.values()),
+
+      // Metadata
+      metadata: {
+        scrapedAt: new Date().toISOString(),
+        totalCommissions: data.commissions.size,
+        totalProjects: data.projects.size,
+        totalBeneficiaries: data.beneficiaries.size,
+        totalTalents: data.talents.size,
+        dataStructure: 'normalized',
+        version: '2.0',
+        scrapedAids: targetAids,  // Aids that were just scraped
+        allAids: allAidNames,      // All aids present in the data
+        isPartialUpdate: preservedData !== null
+      }
+    };
+
+    // Save to JSON
+    const outputDir = join(__dirname, '..', 'data');
+    mkdirSync(outputDir, { recursive: true });
+
+    const outputPath = join(outputDir, 'cnc-data.json');
+    writeFileSync(outputPath, JSON.stringify(output, null, 2), 'utf-8');
+
+    console.log('\n=== Scraping Complete ===');
+    if (output.metadata.isPartialUpdate) {
+      console.log(`✓ Partial update completed for ${targetAids.length} aid(s)`);
+      console.log(`  Scraped aids: ${targetAids.join(', ')}`);
+      console.log(`  Total aids in data: ${output.metadata.allAids.length}`);
+    } else {
+      console.log(`✓ Full scrape completed for ${targetAids.length} aid(s)`);
+    }
+    console.log(`\nFinal totals:`);
+    console.log(`  Commissions: ${output.metadata.totalCommissions}`);
+    console.log(`  Projects: ${output.metadata.totalProjects}`);
+    console.log(`  Beneficiaries: ${output.metadata.totalBeneficiaries}`);
+    console.log(`  Talents: ${output.metadata.totalTalents}`);
+    console.log(`\nData saved to: ${outputPath}`);
+
+  } catch (error) {
+    console.error('Scraping failed:', error);
+    throw error;
+  }
+}
+
+// Run the scraper
+scrape().catch(console.error);
