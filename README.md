@@ -1,5 +1,7 @@
 # Explorateur de Financements CNC
 
+https://saladeolivier.github.io/cnc/
+
 Un site web statique pour explorer, filtrer et analyser les décisions de financement du Centre National du Cinéma et de l'Image Animée (CNC), spécifiquement pour le programme "Fonds d'aide aux créateurs vidéo sur Internet (CNC Talent)".
 
 ## Fonctionnalités
